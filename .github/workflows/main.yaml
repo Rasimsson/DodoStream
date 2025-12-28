@@ -188,6 +188,17 @@ jobs:
           echo "EAS CLI version:"
           eas --version
 
+      - name: 🧠 Tune Gradle JVM for CI
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle"
+          cat >> "$HOME/.gradle/gradle.properties" <<'EOF'
+          # CI-only Gradle tuning (avoids :expo-updates:lintVitalAnalyzeRelease Metaspace OOM)
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1536m -Dfile.encoding=UTF-8
+          org.gradle.workers.max=2
+          org.gradle.daemon.performance.disable-logging=true
+          EOF
+
       - name: 📱 Build ${{ matrix.name }}
         id: eas_build
         if: |
