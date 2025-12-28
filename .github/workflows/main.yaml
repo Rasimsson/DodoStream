@@ -1,0 +1,273 @@
+name: React Native CI/CD
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'docs/**'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      buildType:
+        type: choice
+        description: 'Build type to run'
+        options:
+          - dev
+          - prod-apk
+          - prod-aab
+          - ios-dev
+          - ios-prod
+          - publish-expo
+          - publish-stores
+          - all
+      platform:
+        type: choice
+        description: 'Platform to build'
+        default: 'all'
+        options:
+          - android
+          - ios
+          - all
+
+env:
+  EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+  EXPO_APPLE_ID: ${{ secrets.EXPO_APPLE_ID }}
+  EXPO_APPLE_PASSWORD: ${{ secrets.EXPO_APPLE_PASSWORD }}
+  EXPO_TEAM_ID: ${{ secrets.EXPO_TEAM_ID }}
+  GOOGLE_PLAY_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+  NODE_OPTIONS: --openssl-legacy-provider
+
+jobs:
+  check-skip:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+      - name: Skip CI check
+        run: echo "Proceeding with workflow"
+
+  test:
+    needs: check-skip
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🏗 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🏗 Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          package_json_file: package.json
+          run_install: false
+
+      - name: 🏗 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: 📦 Install dependencies
+        run: pnpm install
+
+      - name: 🧪 Run TypeScript check
+        run: pnpm tsc
+
+      - name: 🧹 Run ESLint & Prettier
+        run: pnpm run lint
+
+      # TODO re-enable when stable
+      # - name: ✅ Run Tests
+      #   run: pnpm run test
+
+  build:
+    needs: test
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Android builds
+          - name: 'Android Dev APK'
+            platform: android
+            profile: development
+            output: app-dev.apk
+            node_env: development
+            build_type: dev
+            runs_on: ubuntu-latest
+
+          - name: 'Android Dev TV APK'
+            platform: android
+            profile: development_tv
+            output: app-dev_tv.apk
+            node_env: development
+            build_type: dev
+            runs_on: ubuntu-latest
+
+          # - name: 'Android Production APK'
+          #   platform: android
+          #   profile: production-apk
+          #   output: app-prod.apk
+          #   node_env: production
+          #   build_type: prod-apk
+          #   runs_on: ubuntu-latest
+
+          # - name: 'Android Production AAB'
+          #   platform: android
+          #   profile: production
+          #   output: app-prod.aab
+          #   node_env: production
+          #   build_type: prod-aab
+          #   runs_on: ubuntu-latest
+
+          # # iOS builds
+          # - name: 'iOS Dev'
+          #   platform: ios
+          #   profile: development
+          #   output: app-ios-dev.app
+          #   node_env: development
+          #   build_type: ios-dev
+          #   runs_on: macos-latest
+
+          # - name: 'iOS Production'
+          #   platform: ios
+          #   profile: production
+          #   output: app-ios-prod.ipa
+          #   node_env: production
+          #   build_type: ios-prod
+          #   runs_on: macos-latest
+
+    runs-on: ${{ matrix.runs_on }}
+    name: Build ${{ matrix.name }}
+
+    steps:
+      - name: 🏗 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🏗 Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: 🏗 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: 📦 Install dependencies
+        run: |
+          pnpm install
+          pnpm i -g eas-cli@latest
+
+      - name: 📁 Setup expo-build-disk-cache
+        uses: actions/cache@v3
+        with:
+          path: node_modules/.expo-build-disk-cache
+          key: ${{ runner.os }}-expo-build-disk-cache-${{ hashFiles('**/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-expo-build-disk-cache-
+
+      - name: Verify EAS CLI installation
+        run: |
+          echo "EAS CLI version:"
+          eas --version
+
+      - name: 📱 Build ${{ matrix.name }}
+        if: |
+          github.event_name == 'push' || 
+          github.event.inputs.buildType == 'all' || 
+          github.event.inputs.buildType == matrix.build_type ||
+          (github.event.inputs.platform == 'all') ||
+          (github.event.inputs.platform == matrix.platform)
+        run: |
+          export NODE_OPTIONS="--openssl-legacy-provider --max_old_space_size=4096"
+          eas build --platform ${{ matrix.platform }} --profile ${{ matrix.profile }} --local --non-interactive --output=./${{ matrix.output }}
+        env:
+          NODE_ENV: ${{ matrix.node_env }}
+
+      - name: 📦 Upload build artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: ./${{ matrix.output }}
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) || (github.event_name == 'workflow_dispatch' && (github.event.inputs.buildType == 'all' || github.event.inputs.buildType == 'publish-expo' || github.event.inputs.buildType == 'publish-stores'))
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 'Expo Update'
+            type: expo
+            build_type: publish-expo
+
+          # - name: 'Play Store'
+          #   type: play-store
+          #   platform: android
+          #   artifact: app-prod.aab
+          #   build_type: publish-stores
+
+          # - name: 'App Store'
+          #   type: app-store
+          #   platform: ios
+          #   artifact: app-ios-prod.ipa
+          #   build_type: publish-stores
+
+    name: Publish to ${{ matrix.name }}
+
+    steps:
+      - name: 🏗 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🏗 Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: 🏗 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: 📦 Install dependencies
+        run: |
+          pnpm install
+          pnpm i -g eas-cli@latest
+
+      - name: 📥 Download build artifact
+        if: matrix.type != 'expo'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: .
+
+      - name: 🚀 Publish to Expo
+        if: matrix.type == 'expo' && (github.event_name == 'push' || github.event.inputs.buildType == 'all' || github.event.inputs.buildType == 'publish-expo')
+        run: eas update --auto
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+
+      - name: 🚀 Submit to Play Store
+        if: matrix.type == 'play-store' && (github.event.inputs.buildType == 'all' || github.event.inputs.buildType == 'publish-stores') && (github.event.inputs.platform == 'all' || github.event.inputs.platform == 'android')
+        run: eas submit -p android --path ./${{ matrix.artifact }} --non-interactive
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          GOOGLE_PLAY_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
+
+      - name: 🚀 Submit to App Store
+        if: matrix.type == 'app-store' && (github.event.inputs.buildType == 'all' || github.event.inputs.buildType == 'publish-stores') && (github.event.inputs.platform == 'all' || github.event.inputs.platform == 'ios')
+        run: eas submit -p ios --path ./${{ matrix.artifact }} --non-interactive
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_APPLE_ID: ${{ secrets.EXPO_APPLE_ID }}
+          EXPO_APPLE_PASSWORD: ${{ secrets.EXPO_APPLE_PASSWORD }}
+          EXPO_TEAM_ID: ${{ secrets.EXPO_TEAM_ID }}

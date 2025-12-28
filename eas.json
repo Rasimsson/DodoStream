@@ -1,0 +1,62 @@
+{
+  "cli": {
+    "version": ">= 16.17.4",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "base": {
+      "distribution": "internal",
+      "channel": "base"
+    },
+    "development": {
+      "extends": "base",
+      "android": {
+        "gradleCommand": ":app:assembleDebug"
+      },
+      "ios": {
+        "buildConfiguration": "Debug"
+      },
+      "environment": "development",
+      "channel": "development"
+    },
+    "development_tv": {
+      "extends": "development",
+      "env": {
+        "EXPO_TV": "1"
+      },
+      "environment": "development",
+      "channel": "development_tv"
+    },
+    "preview": {
+      "extends": "base",
+      "environment": "preview",
+      "channel": "preview"
+    },
+    "preview_tv": {
+      "extends": "preview",
+      "env": {
+        "EXPO_TV": "1"
+      },
+      "environment": "preview",
+      "channel": "preview_tv"
+    },
+    "production": {
+      "extends": "base",
+      "environment": "production",
+      "channel": "production",
+      "autoIncrement": true
+    },
+    "production_tv": {
+      "extends": "production",
+      "autoIncrement": true,
+      "env": {
+        "EXPO_TV": "1"
+      },
+      "environment": "production",
+      "channel": "production_tv"
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

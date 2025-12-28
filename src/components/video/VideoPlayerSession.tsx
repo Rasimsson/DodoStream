@@ -1,0 +1,420 @@
+import { FC, useCallback, useMemo, useRef, useState } from 'react';
+import { Box } from '@/theme/theme';
+import * as Burnt from 'burnt';
+
+import { RNVideoPlayer } from './RNVideoPlayer';
+import { VLCPlayer } from './VLCPlayer';
+import { PlayerControls } from './PlayerControls';
+import { UpNextPopup, type UpNextResolved } from './UpNextPopup';
+
+import { AudioTrack, PlayerRef, TextTrack } from '@/types/player';
+import type { ContentType } from '@/types/stremio';
+import { useProfileStore } from '@/store/profile.store';
+import { useProfileSettingsStore } from '@/store/profile-settings.store';
+import { useWatchHistoryStore } from '@/store/watch-history.store';
+import { findBestTrackByLanguage, getPreferredLanguageCodes } from '@/utils/languages';
+import {
+  SKIP_FORWARD_SECONDS,
+  SKIP_BACKWARD_SECONDS,
+  PLAYBACK_RATIO_PERSIST_INTERVAL,
+} from '@/constants/playback';
+import { TOAST_DURATION_LONG, TOAST_DURATION_MEDIUM } from '@/constants/ui';
+import { useDebugLogger } from '@/utils/debug';
+import { useMediaNavigation } from '@/hooks/useMediaNavigation';
+import { getVideoSessionId } from '@/utils/stream';
+
+export interface VideoPlayerProps {
+  source: string;
+  title?: string;
+  mediaType: ContentType;
+  metaId: string;
+  videoId?: string;
+  /** Stream behaviorHints.group of the currently playing stream (if any). */
+  bingeGroup?: string;
+  onStop?: () => void;
+  onError?: (message: string) => void;
+}
+
+export interface VideoPlayerSessionProps extends VideoPlayerProps {
+  usedPlayerType: 'vlc' | 'exoplayer';
+  setUsedPlayerType: (next: 'vlc' | 'exoplayer') => void;
+  playerType: 'vlc' | 'exoplayer';
+  automaticFallback: boolean;
+}
+
+export const VideoPlayerSession: FC<VideoPlayerSessionProps> = ({
+  source,
+  title,
+  mediaType,
+  metaId,
+  videoId,
+  bingeGroup,
+  onStop,
+  onError,
+  usedPlayerType,
+  setUsedPlayerType,
+  playerType,
+  automaticFallback,
+}) => {
+  const debug = useDebugLogger('VideoPlayer');
+
+  const playerRef = useRef<PlayerRef>(null);
+  const { replaceToStreams } = useMediaNavigation();
+  const activeProfileId = useProfileStore((state) => state.activeProfileId);
+
+  const { preferredAudioLanguages } = useProfileSettingsStore((state) => ({
+    preferredAudioLanguages: activeProfileId
+      ? state.byProfile[activeProfileId]?.preferredAudioLanguages
+      : undefined,
+    preferredSubtitleLanguages: activeProfileId
+      ? state.byProfile[activeProfileId]?.preferredSubtitleLanguages
+      : undefined,
+  }));
+
+  const resumeHistoryItem = useWatchHistoryStore((state) => {
+    if (!activeProfileId) return undefined;
+    const videoKey = videoId ?? '_';
+    return state.byProfile[activeProfileId]?.[metaId]?.[videoKey];
+  });
+
+  const [paused, setPaused] = useState(true);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isBuffering, setIsBuffering] = useState(false);
+
+  const progressRatio = useMemo(() => {
+    if (duration <= 0) return 0;
+    return currentTime / duration;
+  }, [currentTime, duration]);
+
+  const [audioTracks, setAudioTracks] = useState<AudioTrack[]>([]);
+  const [textTracks, setTextTracks] = useState<TextTrack[]>([]);
+  const [selectedAudioTrack, setSelectedAudioTrack] = useState<AudioTrack>();
+  const [selectedTextTrack, setSelectedTextTrack] = useState<TextTrack>();
+
+  const lastPersistAtRef = useRef(0);
+  const lastKnownTimeRef = useRef(0);
+  const lastKnownDurationRef = useRef(0);
+  const resumeAppliedKeyRef = useRef<string | null>(null);
+  const didPersistLastTargetRef = useRef(false);
+
+  const didStartNextRef = useRef(false);
+  const [autoplayCancelled, setAutoplayCancelled] = useState(false);
+  const [upNextDismissed, setUpNextDismissed] = useState(false);
+
+  const upNextVideoIdRef = useRef<string | undefined>(undefined);
+  const [upNextResolved, setUpNextResolved] = useState<UpNextResolved | undefined>(undefined);
+
+  const handleUpNextResolved = useCallback(
+    (next?: UpNextResolved) => {
+      debug('upNextResolved', {
+        metaId,
+        videoId,
+        bingeGroup,
+        nextVideoId: next?.videoId,
+        nextEpisodeLabel: next?.episodeLabel,
+      });
+      upNextVideoIdRef.current = next?.videoId;
+      setUpNextResolved(next);
+    },
+    [bingeGroup, debug, metaId, videoId]
+  );
+
+  const persistProgress = useCallback(
+    (progressSeconds: number, durationSeconds: number, force = false) => {
+      if (!activeProfileId) return;
+      if (durationSeconds === 0) return;
+
+      const now = Date.now();
+      if (!force && now - lastPersistAtRef.current < PLAYBACK_RATIO_PERSIST_INTERVAL) return;
+
+      lastPersistAtRef.current = now;
+      useWatchHistoryStore.getState().upsertItem({
+        id: metaId,
+        type: mediaType,
+        videoId,
+        progressSeconds,
+        durationSeconds,
+      });
+    },
+    [activeProfileId, mediaType, metaId, videoId]
+  );
+
+  const startNextEpisode = useCallback(() => {
+    if (didStartNextRef.current) return;
+    const nextVideoId = upNextVideoIdRef.current;
+    if (!nextVideoId) return;
+
+    debug('startNextEpisode', {
+      metaId,
+      fromVideoId: videoId,
+      nextVideoId,
+      mediaType,
+      bingeGroup,
+    });
+
+    didStartNextRef.current = true;
+    setUpNextDismissed(true);
+    persistProgress(lastKnownTimeRef.current, lastKnownDurationRef.current, true);
+
+    replaceToStreams(
+      { metaId, videoId: nextVideoId, type: mediaType },
+      { autoPlay: '1', bingeGroup }
+    );
+  }, [bingeGroup, debug, mediaType, metaId, persistProgress, replaceToStreams, videoId]);
+
+  const handleProgress = useCallback(
+    (data: { currentTime: number; duration?: number }) => {
+      setCurrentTime(data.currentTime);
+      lastKnownTimeRef.current = data.currentTime;
+      if (data.duration) {
+        setDuration(data.duration);
+        lastKnownDurationRef.current = data.duration;
+      }
+      persistProgress(data.currentTime, lastKnownDurationRef.current ?? 0);
+    },
+    [persistProgress]
+  );
+
+  const handleBuffering = useCallback(
+    (buffering: boolean) => {
+      debug('buffering', { buffering });
+      setIsBuffering(buffering);
+    },
+    [debug]
+  );
+
+  const handleLoad = useCallback(
+    (data: { duration: number }) => {
+      debug('load', { duration: data.duration, usedPlayerType, playerType, automaticFallback });
+
+      // Only remember the last stream if playback actually starts loading successfully.
+      // This prevents a broken stream URL from being remembered and re-tried forever.
+      if (!didPersistLastTargetRef.current && data.duration > 0) {
+        didPersistLastTargetRef.current = true;
+        useWatchHistoryStore
+          .getState()
+          .setLastStreamTarget(metaId, videoId, mediaType, { type: 'url', value: source });
+      }
+
+      const resumeKey = getVideoSessionId(source, metaId, videoId, usedPlayerType);
+      const shouldApplyResume = resumeAppliedKeyRef.current !== resumeKey;
+      if (shouldApplyResume) {
+        resumeAppliedKeyRef.current = resumeKey;
+      }
+
+      const rawResumeSeconds = resumeHistoryItem?.progressSeconds ?? 0;
+      const durationSeconds = data.duration;
+      const resumeSeconds = shouldApplyResume
+        ? Math.min(Math.max(rawResumeSeconds, 0), Math.max(0, durationSeconds - 1))
+        : 0;
+
+      setDuration(data.duration);
+      setIsLoading(false);
+      setPaused(false);
+      lastKnownDurationRef.current = data.duration;
+
+      if (resumeSeconds > 0) {
+        lastKnownTimeRef.current = resumeSeconds;
+        setCurrentTime(resumeSeconds);
+        setTimeout(() => {
+          playerRef.current?.seekTo(resumeSeconds, durationSeconds);
+        }, 0);
+        persistProgress(resumeSeconds, durationSeconds, true);
+      } else {
+        persistProgress(lastKnownTimeRef.current, durationSeconds, true);
+      }
+    },
+    [
+      automaticFallback,
+      debug,
+      metaId,
+      mediaType,
+      persistProgress,
+      playerType,
+      resumeHistoryItem?.progressSeconds,
+      source,
+      usedPlayerType,
+      videoId,
+    ]
+  );
+
+  const handleEnd = useCallback(() => {
+    debug('end');
+    persistProgress(lastKnownDurationRef.current, lastKnownDurationRef.current, true);
+    if (!autoplayCancelled && !!upNextVideoIdRef.current) {
+      debug('autoStartNextOnEnd', {
+        metaId,
+        videoId,
+        nextVideoId: upNextVideoIdRef.current,
+        autoplayCancelled,
+      });
+      startNextEpisode();
+      return;
+    }
+    onStop?.();
+  }, [autoplayCancelled, debug, metaId, onStop, persistProgress, startNextEpisode, videoId]);
+
+  const handleError = useCallback(
+    (message: string) => {
+      debug('error', { message, automaticFallback, playerType, usedPlayerType });
+
+      if (automaticFallback && playerType === usedPlayerType) {
+        const newPlayer = usedPlayerType === 'exoplayer' ? 'vlc' : 'exoplayer';
+        debug('attemptingFallback', { from: usedPlayerType, to: newPlayer });
+        Burnt.toast({
+          title: `Switching to ${newPlayer === 'vlc' ? 'VLC' : 'ExoPlayer'}`,
+          preset: 'error',
+          haptic: 'warning',
+          duration: TOAST_DURATION_MEDIUM,
+        });
+        setIsLoading(true);
+        setUsedPlayerType(newPlayer);
+      } else {
+        Burnt.toast({
+          title: 'Playback Error',
+          message: message,
+          preset: 'error',
+          haptic: 'error',
+          duration: TOAST_DURATION_LONG,
+        });
+        onError?.(message);
+      }
+    },
+    [automaticFallback, debug, playerType, usedPlayerType, setUsedPlayerType, onError]
+  );
+
+  const handlePlayPause = useCallback(() => {
+    debug('togglePlayPause');
+    setPaused((prev) => !prev);
+  }, [debug]);
+
+  const handleSeek = useCallback(
+    (time: number) => {
+      debug('seek', { time, duration });
+      playerRef.current?.seekTo(time, duration);
+      setCurrentTime(time);
+      persistProgress(time, duration, true);
+      lastKnownTimeRef.current = time;
+    },
+    [debug, duration, persistProgress]
+  );
+
+  const handleSkipBackward = useCallback(() => {
+    debug('skipBackward');
+    const newTime = Math.max(0, currentTime - SKIP_BACKWARD_SECONDS);
+    handleSeek(newTime);
+  }, [currentTime, debug, handleSeek]);
+
+  const handleSkipForward = useCallback(() => {
+    debug('skipForward');
+    const newTime = Math.min(duration, currentTime + SKIP_FORWARD_SECONDS);
+    handleSeek(newTime);
+  }, [currentTime, debug, duration, handleSeek]);
+
+  const handleAudioTracksLoaded = useCallback(
+    (tracks: AudioTrack[]) => {
+      debug('audioTracksLoaded', { count: tracks.length });
+      setAudioTracks(tracks);
+
+      if (selectedAudioTrack || tracks.length === 0) return;
+
+      const preferredAudioLanguageCodes = getPreferredLanguageCodes(preferredAudioLanguages);
+      const bestAudio = findBestTrackByLanguage(tracks, preferredAudioLanguageCodes) ?? tracks[0];
+      setSelectedAudioTrack(bestAudio);
+    },
+    [debug, preferredAudioLanguages, selectedAudioTrack]
+  );
+
+  const handleTextTracksLoaded = useCallback(
+    (tracks: TextTrack[]) => {
+      debug('textTracksLoaded', { count: tracks.length });
+      setTextTracks(tracks);
+    },
+    [debug]
+  );
+
+  const handleSelectAudioTrack = useCallback(
+    (index: number) => {
+      debug('selectAudioTrack', { index });
+      const chosenAudioTrack = audioTracks.find((at) => at.index === index);
+      if (chosenAudioTrack && (!selectedAudioTrack || selectedAudioTrack.index !== index)) {
+        setSelectedAudioTrack(chosenAudioTrack);
+      }
+    },
+    [audioTracks, debug, selectedAudioTrack]
+  );
+
+  const handleSelectTextTrack = useCallback(
+    (index?: number) => {
+      debug('selectTextTrack', { index });
+      if (index === undefined) {
+        setSelectedTextTrack(undefined);
+        return;
+      }
+      const chosenTextTrack = textTracks.find((tt) => tt.index === index);
+      if (chosenTextTrack && (!selectedTextTrack || selectedTextTrack.index !== index)) {
+        setSelectedTextTrack(chosenTextTrack);
+      }
+    },
+    [debug, selectedTextTrack, textTracks]
+  );
+
+  const PlayerComponent = usedPlayerType === 'vlc' ? VLCPlayer : RNVideoPlayer;
+  return (
+    <Box flex={1} backgroundColor="playerBackground">
+      <PlayerComponent
+        key={`player-${usedPlayerType}`}
+        ref={playerRef}
+        source={source}
+        paused={paused}
+        onProgress={handleProgress}
+        onLoad={handleLoad}
+        onBuffer={handleBuffering}
+        onEnd={handleEnd}
+        onError={handleError}
+        onAudioTracks={handleAudioTracksLoaded}
+        onTextTracks={handleTextTracksLoaded}
+        selectedAudioTrack={selectedAudioTrack}
+        selectedTextTrack={selectedTextTrack}
+      />
+
+      <PlayerControls
+        paused={paused}
+        currentTime={currentTime}
+        duration={duration}
+        showLoadingIndicator={isLoading || isBuffering}
+        title={title}
+        audioTracks={audioTracks}
+        textTracks={textTracks}
+        selectedAudioTrack={selectedAudioTrack}
+        selectedTextTrack={selectedTextTrack}
+        onPlayPause={handlePlayPause}
+        onSeek={handleSeek}
+        onSkipBackward={handleSkipBackward}
+        onSkipForward={handleSkipForward}
+        showSkipEpisode={!!upNextResolved?.videoId}
+        skipEpisodeLabel={upNextResolved?.episodeLabel}
+        onSkipEpisode={startNextEpisode}
+        onBack={onStop}
+        onSelectAudioTrack={handleSelectAudioTrack}
+        onSelectTextTrack={handleSelectTextTrack}
+      />
+
+      <UpNextPopup
+        enabled={!didStartNextRef.current}
+        metaId={metaId}
+        mediaType={mediaType}
+        videoId={videoId}
+        progressRatio={progressRatio}
+        dismissed={upNextDismissed}
+        autoplayCancelled={autoplayCancelled}
+        onCancelAutoplay={() => setAutoplayCancelled(true)}
+        onDismiss={() => setUpNextDismissed(true)}
+        onPlayNext={startNextEpisode}
+        onUpNextResolved={handleUpNextResolved}
+      />
+    </Box>
+  );
+};
