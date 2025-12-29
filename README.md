@@ -47,6 +47,8 @@ Supports **Stremio Addons** (see details below).
 
 ## Screenshots
 
+These *are* outdated but kept for an initial impression.
+
 ![](docs/screenshots/tv/home-continue-watching.png)
 ![](docs/screenshots/tv/details.png)
 ![](docs/screenshots/tv/playback-tv.png)
@@ -57,8 +59,6 @@ See more screenshots in the [docs/screenshots](docs/screenshots) folder.
 ## Roadmap
 
 This project is under active development. Expect occasional breaking changes, unfinished features, and rough edges.
-
-**There is no public release yet, star & activate notifications to be notified.**
 
 ### Implemented
 
@@ -82,7 +82,7 @@ This project is under active development. Expect occasional breaking changes, un
 - [x] My List (local, per-profile)
 - [x] New release checking
 
-## Features
+### Features
 
 - [ ] YouTube Player Support (for Streams & Trailers)
 - [ ] Library (old "My List") Page with watched/finished media/lists from providers
@@ -132,6 +132,7 @@ This project is under active development. Expect occasional breaking changes, un
 - [ ] Show "Ends at" time when playing & current system time
 - [ ] Adaptive Frame Rate Support
 - [ ] Button that links to addon configuration page if addon is configurable
+- [ ] Accessibility
 
 ### Full Stremio Addon SDK Support
 
