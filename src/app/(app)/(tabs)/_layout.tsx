@@ -23,10 +23,9 @@ export default function TabsLayout() {
                 backgroundColor: theme.colors.cardBackground,
                 borderTopColor: theme.colors.cardBorder,
                 borderTopWidth: 1,
-                height: 85,
-                paddingBottom: bottom + 10,
+                paddingBottom: bottom,
                 paddingTop: 10,
-                marginTop: 0,
+                height: 65 + bottom,
               }
             : {
                 display: 'none', // Hide tabs on tablet/TV
