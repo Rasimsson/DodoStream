@@ -372,6 +372,23 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: 📂 Unzip downloaded artifacts
+        id: unzip-artifacts
+        shell: bash
+        run: |
+          echo "Listing downloaded artifacts:"
+          ls -lh dist/
+
+          echo "Unzipping any archived artifacts..."
+          find dist/ -name "*.zip" -type f 2>/dev/null | while read zip; do
+            echo "Unzipping $zip"
+            unzip -o "$zip" -d dist/
+            rm "$zip"
+          done
+
+          echo "Final list of artifacts in dist/:"
+          ls -lh dist/
+
       - name: 🏷️ Create GitHub Release if not exists
         uses: ncipollo/release-action@v1
         with:
